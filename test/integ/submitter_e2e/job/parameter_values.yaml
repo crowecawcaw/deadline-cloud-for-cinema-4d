@@ -1,17 +1,16 @@
+# Default parameter values when submitting via:
+#
+#   deadline bundle submit test/integ/submitter_e2e/job
+#
+# But the typical entrypoint is `python submit.py` from the parent directory,
+# which embeds run_test.py / driver.py into the template at submission time.
 parameterValues:
-# These point at the orchestrator + c4dpy driver in this repo. The deadline
-# CLI uploads them as job attachments; the worker resolves the values to
-# the local copies under the session working dir.
-- name: RunTest
-  value: ../run_test.py
-- name: Driver
-  value: ../driver.py
 - name: SourceMode
   value: github
 - name: GitRepo
-  value: https://github.com/crowecawcaw/deadline-cloud-for-cinema-4d.git
+  value: https://github.com/aws-deadline/deadline-cloud-for-cinema-4d.git
 - name: GitRef
-  value: add-submitter-e2e
+  value: mainline
 # Queue-env parameter overrides: install the cinema4d package from the
 # deadline-cloud channel before our step runs.
 - name: CondaPackages

@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import urllib.request
@@ -48,6 +49,38 @@ def section(title: str) -> None:
     print("=" * 60, flush=True)
     print(title, flush=True)
     print("=" * 60, flush=True)
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """
+    Cinema 4D's bundled Python on Windows ships without a CA bundle, so
+    ``urllib`` HTTPS requests fail with ``CERTIFICATE_VERIFY_FAILED``. Try
+    in order:
+
+        1. certifi (if importable) — most portable.
+        2. Windows certificate store via ssl.enum_certificates.
+        3. Last-resort: an unverified context with a clear warning.
+    """
+    try:
+        import certifi  # type: ignore[import-not-found]
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    if sys.platform == "win32":
+        try:
+            ctx = ssl.create_default_context()
+            ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
+            for store in ("ROOT", "CA"):
+                for cert, _, _ in ssl.enum_certificates(store):
+                    try:
+                        ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert))
+                    except ssl.SSLError:
+                        continue
+            return ctx
+        except Exception:
+            pass
+    log("WARNING: falling back to an unverified SSL context for HTTPS download")
+    return ssl._create_unverified_context()
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +118,23 @@ def resolve_c4d_paths() -> dict[str, Path]:
 # --------------------------------------------------------------------------- #
 # Source mode: github
 # --------------------------------------------------------------------------- #
+def install_test_deps(c4d_python: Path) -> None:
+    """
+    Pre-install the python deps the test itself needs, into Cinema 4D's
+    bundled Python:
+        * certifi — for HTTPS downloads (C4D's python ships without a CA bundle)
+        * pyyaml  — for the bundle assertions
+        * hatchling / hatch-vcs — used by the submitter build (github mode)
+        * pip upgrade — newer pip handles --no-build-isolation cleanly
+    """
+    log(f"Pre-installing test deps via {c4d_python}")
+    subprocess.run(
+        [str(c4d_python), "-m", "pip", "install", "--no-warn-script-location",
+         "--upgrade", "pip", "hatchling", "hatch-vcs", "pyyaml", "certifi"],
+        check=True,
+    )
+
+
 def stage_from_github(work_dir: Path, repo: str, ref: str, c4d_python: Path) -> Path:
     """
     Download the submitter source as a GitHub archive and pip-install it into
@@ -109,7 +159,13 @@ def stage_from_github(work_dir: Path, repo: str, ref: str, c4d_python: Path) -> 
 
     zip_url = f"https://github.com/{repo_path}/archive/{ref}.zip"
     log(f"Downloading {zip_url}")
-    urllib.request.urlretrieve(zip_url, src_zip)
+    # Cinema 4D's bundled Python doesn't ship a CA bundle, so urlretrieve's
+    # default SSL context fails verification on Windows. Use a context backed
+    # by certifi if available; otherwise fall back to the system store via
+    # ssl.create_default_context() with a Windows-specific cert load.
+    ctx = _build_ssl_context()
+    with urllib.request.urlopen(zip_url, context=ctx) as resp, open(src_zip, "wb") as f:
+        shutil.copyfileobj(resp, f)
 
     log(f"Extracting to {src_extract}")
     with zipfile.ZipFile(src_zip) as zf:
@@ -131,12 +187,7 @@ def stage_from_github(work_dir: Path, repo: str, ref: str, c4d_python: Path) -> 
         "HATCH_BUILD_HOOK_VCS_VERSION": "0.0.0+e2e",
     }
 
-    # Build deps first so --no-build-isolation can re-use them.
-    subprocess.run(
-        [str(c4d_python), "-m", "pip", "install", "--no-warn-script-location",
-         "--upgrade", "pip", "hatchling", "hatch-vcs", "pyyaml"],
-        check=True, env=env,
-    )
+    # Build deps already installed up front. Now install the submitter.
     subprocess.run(
         [str(c4d_python), "-m", "pip", "install", "--no-warn-script-location",
          "--no-build-isolation", "--target", str(install_dir),
@@ -344,6 +395,7 @@ def main() -> int:
 
     paths = resolve_c4d_paths()
     args.work_dir.mkdir(parents=True, exist_ok=True)
+    install_test_deps(paths["python"])
 
     if args.mode == "github":
         install_dir = stage_from_github(

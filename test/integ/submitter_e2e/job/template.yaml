@@ -6,19 +6,10 @@ description: >
     * github   — install the submitter from a Git ref (dev workflow).
     * installer — run the InstallBuilder-produced .exe attached as the
       Installer parameter (full integration test).
-  All test logic lives in run_test.py / driver.py (also attached as job
-  inputs); this template only sets up the env and hands off.
+  All test logic lives in run_test.py and driver.py inside this bundle and
+  is shipped as embedded files; this template only sets up the env and
+  invokes the orchestrator.
 parameterDefinitions:
-- name: RunTest
-  type: PATH
-  objectType: FILE
-  dataFlow: IN
-  description: Path to run_test.py (the orchestrator).
-- name: Driver
-  type: PATH
-  objectType: FILE
-  dataFlow: IN
-  description: Path to driver.py (the c4dpy-side script).
 - name: SourceMode
   type: STRING
   default: github
@@ -58,8 +49,8 @@ steps:
       type: TEXT
       filename: run.ps1
       data: |
-        # Thin shim: just hands off to run_test.py with the right args.
-        # All test logic lives in the Python orchestrator.
+        # Thin shim: locate Cinema 4D's bundled python and hand off to
+        # run_test.py. All test logic lives in the Python orchestrator.
         $ErrorActionPreference = 'Stop'
         $ProgressPreference    = 'SilentlyContinue'
 
@@ -75,12 +66,15 @@ steps:
         $work = Join-Path $env:OPENJD_SESSION_WORKING_DIR 'submitter-e2e'
         New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-        # run_test.py imports driver.py from the same directory, so make sure
-        # they end up co-located in $work.
-        Copy-Item -Force '{{Param.Driver}}'  (Join-Path $work 'driver.py')
+        $runTest = '{{Task.File.RunTest}}'
+        $driver  = '{{Task.File.Driver}}'
+
+        # run_test.py imports driver.py from the same directory, so co-locate
+        # them in $work.
+        Copy-Item -Force $driver (Join-Path $work 'driver.py')
 
         $args = @(
-          '{{Param.RunTest}}',
+          $runTest,
           '--mode', '{{Param.SourceMode}}',
           '--work-dir', $work
         )
@@ -96,3 +90,18 @@ steps:
         Write-Host "Handing off to: $c4dPython $args"
         & $c4dPython @args
         if ($LASTEXITCODE -ne 0) { throw "run_test.py failed (exit $LASTEXITCODE)" }
+    - name: RunTest
+      type: TEXT
+      filename: run_test.py
+      runnable: false
+      data: |
+        # GENERATED — do not edit. Source: test/integ/submitter_e2e/run_test.py
+        # Re-embed by running scripts/embed_e2e_files.py before submitting.
+        raise SystemExit("run_test.py was not embedded; run scripts/embed_e2e_files.py")
+    - name: Driver
+      type: TEXT
+      filename: driver.py
+      runnable: false
+      data: |
+        # GENERATED — do not edit. Source: test/integ/submitter_e2e/driver.py
+        raise SystemExit("driver.py was not embedded; run scripts/embed_e2e_files.py")
