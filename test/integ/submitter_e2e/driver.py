@@ -81,15 +81,75 @@ DIALOG_TITLE_PREFIX = "Deadline Cloud "
 
 
 def _dump_tree_safely(out_path: Path) -> None:
-    """Best-effort accessibility tree dump for failure triage."""
+    """
+    Best-effort accessibility tree dump for failure triage.
+
+    Tries (in order):
+      1. The c4dpy process by pid (the dialog runs in-process).
+      2. Every running app xa11y can see (so we know whether the worker
+         can introspect any UI at all — useful for Session-0-style issues
+         on Windows SMF workers).
+    """
+    chunks: list[str] = []
     try:
         import xa11y  # type: ignore[import-not-found]
-        a = xa11y.App.by_pid(os.getpid(), timeout=2.0)
-        out_path.write_text(a.dump(), encoding="utf-8")
-        log(f"dumped a11y tree to {out_path}")
     except Exception:
-        log("failed to dump a11y tree")
+        log("xa11y unavailable, cannot dump tree")
+        return
+
+    try:
+        chunks.append(f"=== own pid: {os.getpid()} ===")
+        a = xa11y.App.by_pid(os.getpid(), timeout=2.0)
+        chunks.append(a.dump())
+    except Exception as e:
+        chunks.append(f"App.by_pid({os.getpid()}) failed: {type(e).__name__}: {e}")
+
+    try:
+        chunks.append("=== xa11y.App.list() ===")
+        for app in xa11y.App.list():
+            chunks.append(f"- name={app.name!r} pid={app.pid}")
+            try:
+                chunks.append(app.dump(max_depth=3))
+            except Exception as e:
+                chunks.append(f"  dump failed: {type(e).__name__}: {e}")
+    except Exception as e:
+        chunks.append(f"App.list() failed: {type(e).__name__}: {e}")
+
+    try:
+        out_path.write_text("\n".join(chunks), encoding="utf-8")
+        log(f"dumped a11y diagnostics to {out_path}")
+    except Exception:
+        log("failed to write a11y diagnostics file")
         traceback.print_exc()
+
+
+def _attach_xa11y_app(xa11y, my_pid: int, deadline: float):
+    """
+    Find an xa11y App handle for our submitter UI. On Windows SMF workers
+    UI Automation sometimes doesn't expose c4dpy under our own pid right
+    away (Session 0 / no logged-in desktop), so fall back to scanning
+    every running app for a window matching the submitter title.
+    """
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return xa11y.App.by_pid(my_pid, timeout=1.0)
+        except Exception as e:
+            last_err = e
+        try:
+            for app in xa11y.App.list():
+                try:
+                    if app.locator(f"window[name^='{DIALOG_TITLE_PREFIX}']").exists():
+                        log(f"xa11y attached via App.list(): name={app.name!r} pid={app.pid}")
+                        return app
+                except Exception:
+                    continue
+        except Exception as e:
+            last_err = e
+        time.sleep(1.0)
+    raise RuntimeError(
+        f"xa11y could not find an app hosting the submitter dialog. last_err={last_err!r}"
+    )
 
 
 def _automate_submitter(output_dir: Path, errors: list[str]) -> None:
@@ -102,9 +162,9 @@ def _automate_submitter(output_dir: Path, errors: list[str]) -> None:
     try:
         import xa11y  # type: ignore[import-not-found]
 
-        # The dialog is hosted inside the c4dpy process.
-        app = xa11y.App.by_pid(os.getpid(), timeout=30.0)
-        log(f"xa11y attached to pid={os.getpid()} app={app.name!r}")
+        deadline_ts = time.monotonic() + 60.0
+        app = _attach_xa11y_app(xa11y, os.getpid(), deadline_ts)
+        log(f"xa11y attached: name={app.name!r} pid={app.pid}")
 
         dlg = app.locator(f"window[name^='{DIALOG_TITLE_PREFIX}']")
         dlg.wait_visible(timeout=30.0)
@@ -115,10 +175,20 @@ def _automate_submitter(output_dir: Path, errors: list[str]) -> None:
 
         win_elem = dlg.element()
         screenshot_path = output_dir / "submitter-window.png"
-        xa11y.screenshot(element=win_elem).save_png(str(screenshot_path))
-        log(f"saved screenshot: {screenshot_path}")
+        try:
+            xa11y.screenshot(element=win_elem).save_png(str(screenshot_path))
+            log(f"saved screenshot: {screenshot_path}")
+        except Exception:
+            log("element screenshot failed, falling back to full-screen capture")
+            traceback.print_exc()
+            try:
+                xa11y.screenshot().save_png(str(screenshot_path))
+                log(f"saved fallback full-screen screenshot: {screenshot_path}")
+            except Exception:
+                log("fallback screenshot also failed")
+                traceback.print_exc()
 
-        export_btn = dlg.locator("button[name='Export bundle']")
+        export_btn = dlg.descendant("button[name='Export bundle']")
         export_btn.wait_visible(timeout=10.0)
         log("clicking Export bundle")
         export_btn.press()
@@ -182,6 +252,23 @@ def _launch_submitter(output_dir: Path, scene_dir: Path) -> Path:
         daemon=True,
     )
     automation.start()
+
+    # If automation hangs (e.g. xa11y can't see the dialog) the modal
+    # exec_() would block forever. Force-close after a generous timeout.
+    HANG_TIMEOUT_S = 240
+
+    def _force_close():
+        log(f"force-close timer fired after {HANG_TIMEOUT_S}s — closing dialog")
+        try:
+            dialog.close()
+        except Exception:
+            traceback.print_exc()
+
+    from qtpy.QtCore import QTimer  # type: ignore[import-not-found]
+    timer = QTimer()
+    timer.setSingleShot(True)
+    timer.timeout.connect(_force_close)
+    timer.start(HANG_TIMEOUT_S * 1000)
 
     log("entering dialog.exec_()")
     dialog.exec_()
