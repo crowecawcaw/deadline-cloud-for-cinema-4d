@@ -208,6 +208,30 @@ def _launch_submitter(output_dir: Path) -> tuple[Path, int]:
     watcher.join(timeout=5)
     exit_code = sidecar_result.get("exit", -1)
 
+    # Tee the sidecar log to our own stdout so it lands in CloudWatch and
+    # we don't have to wait for job-output upload to triage failures.
+    if sidecar_log.is_file():
+        log(f"--- begin {sidecar_log.name} ---")
+        try:
+            for line in sidecar_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                print(line, flush=True)
+        except Exception:
+            traceback.print_exc()
+        log(f"--- end {sidecar_log.name} ---")
+    tree = output_dir / "submitter-tree.txt"
+    if tree.is_file():
+        log(f"--- begin {tree.name} ({tree.stat().st_size} bytes) ---")
+        try:
+            text = tree.read_text(encoding="utf-8", errors="replace")
+            # Cap at 30 KB so we don't blow out CloudWatch on huge dumps.
+            if len(text) > 30_000:
+                text = text[:30_000] + f"\n... [truncated, full file is {tree.stat().st_size} bytes]"
+            for line in text.splitlines():
+                print(line, flush=True)
+        except Exception:
+            traceback.print_exc()
+        log(f"--- end {tree.name} ---")
+
     # Find the exported bundle dir under job_history_dir/<YYYY-mm>/.
     bundles = sorted(p for p in job_history_dir.glob("*/*") if p.is_dir())
     if not bundles:

@@ -88,6 +88,10 @@ def main() -> int:
 
         cmd = [
             "deadline", "bundle", "submit", str(staged),
+            # Fail fast — retries cost ~5 min each on a Windows worker
+            # because of the cinema4d conda + pip install setup. The test
+            # is meant to be re-submitted, not retried internally.
+            "--max-retries-per-task", "0",
             "-p", f"SourceMode={args.mode}",
         ]
         if args.git_repo:
