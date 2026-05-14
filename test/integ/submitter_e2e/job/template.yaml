@@ -31,6 +31,15 @@ parameterDefinitions:
   description: >
     Path to an InstallBuilder-produced submitter installer .exe attached
     as a job input (mode=installer). Ignored for mode=github.
+- name: OutputDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: OUT
+  default: ./e2e-output
+  description: >
+    Directory the test writes its artifacts into (submitter screenshot,
+    exported job bundle, a11y tree on failure). Declared as an OUT path
+    so it's uploaded back as a job output for inspection.
 
 steps:
 - name: SubmitterE2E
@@ -66,6 +75,9 @@ steps:
         $work = Join-Path $env:OPENJD_SESSION_WORKING_DIR 'submitter-e2e'
         New-Item -ItemType Directory -Force -Path $work | Out-Null
 
+        $outDir = '{{Param.OutputDir}}'
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
         $runTest = '{{Task.File.RunTest}}'
         $driver  = '{{Task.File.Driver}}'
 
@@ -76,7 +88,8 @@ steps:
         $args = @(
           $runTest,
           '--mode', '{{Param.SourceMode}}',
-          '--work-dir', $work
+          '--work-dir', $work,
+          '--output-dir', $outDir
         )
         if ('{{Param.SourceMode}}' -eq 'github') {
           $args += @('--git-repo', '{{Param.GitRepo}}', '--git-ref', '{{Param.GitRef}}')

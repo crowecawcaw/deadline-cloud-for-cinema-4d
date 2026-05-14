@@ -125,12 +125,14 @@ def install_test_deps(c4d_python: Path) -> None:
         * certifi — for HTTPS downloads (C4D's python ships without a CA bundle)
         * pyyaml  — for the bundle assertions
         * hatchling / hatch-vcs — used by the submitter build (github mode)
+        * xa11y   — drives the submitter UI (click Export bundle, screenshot)
         * pip upgrade — newer pip handles --no-build-isolation cleanly
     """
     log(f"Pre-installing test deps via {c4d_python}")
     subprocess.run(
         [str(c4d_python), "-m", "pip", "install", "--no-warn-script-location",
-         "--upgrade", "pip", "hatchling", "hatch-vcs", "pyyaml", "certifi"],
+         "--upgrade", "pip", "hatchling", "hatch-vcs", "pyyaml", "certifi",
+         "xa11y"],
         check=True,
     )
 
@@ -244,9 +246,9 @@ def stage_from_installer(work_dir: Path, installer_path: Path) -> Path:
 # --------------------------------------------------------------------------- #
 # Driver step (runs inside c4dpy)
 # --------------------------------------------------------------------------- #
-def run_driver(c4dpy: Path, driver: Path, submitter_install: Path, bundle_dir: Path) -> None:
+def run_driver(c4dpy: Path, driver: Path, submitter_install: Path, output_dir: Path) -> None:
     section("Running driver inside c4dpy")
-    bundle_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     if not driver.is_file():
         raise FileNotFoundError(f"driver.py not found at {driver}")
 
@@ -267,9 +269,9 @@ def run_driver(c4dpy: Path, driver: Path, submitter_install: Path, bundle_dir: P
 
     log(f"c4dpy: {c4dpy}")
     log(f"driver: {driver}")
-    log(f"bundle out: {bundle_dir}")
+    log(f"output dir: {output_dir}")
     result = subprocess.run(
-        [str(c4dpy), driver.name, str(bundle_dir)],
+        [str(c4dpy), driver.name, str(output_dir)],
         cwd=str(driver.parent),
         env=env,
     )
@@ -371,6 +373,12 @@ def main() -> int:
         help="Workspace directory for staging files (typically the session working dir)."
     )
     parser.add_argument(
+        "--output-dir", type=Path,
+        help="Directory for artifacts that should be uploaded as job outputs "
+             "(screenshot, exported bundle, a11y tree on failure). Defaults to "
+             "<work-dir>/e2e-output."
+    )
+    parser.add_argument(
         "--git-repo", default="https://github.com/aws-deadline/deadline-cloud-for-cinema-4d.git",
         help="GitHub repo URL (mode=github)."
     )
@@ -422,10 +430,44 @@ def main() -> int:
     else:
         driver = Path(__file__).parent / "driver.py"
 
-    bundle_dir = args.work_dir / "exported-bundle"
-    run_driver(paths["c4dpy"], driver, install_dir, bundle_dir)
+    # Have the driver write directly into the OUT dir so artifacts are
+    # uploaded as job outputs without an extra copy step.
+    driver_out = (args.output_dir or (args.work_dir / "e2e-output")).resolve()
+    driver_out.mkdir(parents=True, exist_ok=True)
+    run_driver(paths["c4dpy"], driver, install_dir, driver_out)
 
-    assert_bundle(bundle_dir)
+    # Surface artifacts as job outputs (the OpenJD step declares the
+    # session working dir as an OUT path).
+    section("Driver artifacts")
+    if driver_out.exists():
+        for p in sorted(driver_out.rglob("*")):
+            if p.is_file():
+                log(f"  {p.relative_to(driver_out)}  ({p.stat().st_size} bytes)")
+
+    bundle_path_marker = driver_out / "bundle-path.txt"
+    if not bundle_path_marker.is_file():
+        raise RuntimeError(
+            f"driver did not write {bundle_path_marker} — submitter UI did not "
+            "complete an Export bundle. Check submitter-tree.txt for the a11y dump."
+        )
+    bundle_dir = Path(bundle_path_marker.read_text(encoding="utf-8").strip())
+    if not bundle_dir.is_dir():
+        raise RuntimeError(f"bundle-path.txt points at non-existent dir: {bundle_dir}")
+
+    # Copy the bundle into the worker's output dir so it gets picked up as
+    # a job output alongside the screenshot.
+    artifact_bundle = driver_out / "exported-bundle"
+    if artifact_bundle.exists():
+        shutil.rmtree(artifact_bundle)
+    shutil.copytree(bundle_dir, artifact_bundle)
+    log(f"copied bundle to {artifact_bundle}")
+
+    assert_bundle(artifact_bundle)
+
+    # The screenshot is the proof the dialog actually opened — fail loud
+    # if it's missing even though the bundle assertions passed.
+    screenshot = driver_out / "submitter-window.png"
+    _check(screenshot.is_file(), f"submitter window screenshot exists at {screenshot}")
 
     section("C4D Submitter E2E Test PASSED")
     return 0
