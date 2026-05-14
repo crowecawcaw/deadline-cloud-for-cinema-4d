@@ -81,12 +81,9 @@ steps:
         $runTest = '{{Task.File.RunTest}}'
         $driver  = '{{Task.File.Driver}}'
 
-        $automate = '{{Task.File.Automate}}'
-
-        # run_test.py imports driver.py from the same directory, and driver.py
-        # spawns automate.py from there too — co-locate them in $work.
+        # run_test.py imports driver.py from the same directory, so co-locate
+        # them in $work.
         Copy-Item -Force $driver (Join-Path $work 'driver.py')
-        Copy-Item -Force $automate (Join-Path $work 'automate.py')
 
         $args = @(
           $runTest,
@@ -121,10 +118,3 @@ steps:
       data: |
         # GENERATED — do not edit. Source: test/integ/submitter_e2e/driver.py
         raise SystemExit("driver.py was not embedded; run scripts/embed_e2e_files.py")
-    - name: Automate
-      type: TEXT
-      filename: automate.py
-      runnable: false
-      data: |
-        # GENERATED — do not edit. Source: test/integ/submitter_e2e/automate.py
-        raise SystemExit("automate.py was not embedded; run submit.py to embed it")

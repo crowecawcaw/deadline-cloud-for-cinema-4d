@@ -125,14 +125,12 @@ def install_test_deps(c4d_python: Path) -> None:
         * certifi — for HTTPS downloads (C4D's python ships without a CA bundle)
         * pyyaml  — for the bundle assertions
         * hatchling / hatch-vcs — used by the submitter build (github mode)
-        * xa11y   — drives the submitter UI (click Export bundle, screenshot)
         * pip upgrade — newer pip handles --no-build-isolation cleanly
     """
     log(f"Pre-installing test deps via {c4d_python}")
     subprocess.run(
         [str(c4d_python), "-m", "pip", "install", "--no-warn-script-location",
-         "--upgrade", "pip", "hatchling", "hatch-vcs", "pyyaml", "certifi",
-         "xa11y"],
+         "--upgrade", "pip", "hatchling", "hatch-vcs", "pyyaml", "certifi"],
         check=True,
     )
 

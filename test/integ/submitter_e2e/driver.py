@@ -4,17 +4,17 @@ c4dpy-side driver for the E2E test.
 
 Runs inside Cinema 4D's bundled Python (c4dpy). Builds a tiny scene, launches
 the real Qt submitter dialog (the same one users see when they click
-"Submit to AWS Deadline Cloud"), and lets a sidecar process (automate.py,
-running in a regular Python interpreter) drive it via xa11y to:
+"Submit to AWS Deadline Cloud"), then drives it with Qt directly to:
 
-  * screenshot the submitter window
+  * screenshot the submitter window via QWidget.grab()
   * click the "Export bundle" button
   * dismiss the success message dialog
 
-The sidecar approach exists because xa11y's Windows UI Automation backend
-can't reliably introspect the calling process from a worker thread while
-the main thread is parked inside QDialog.exec_(). Driving the UI from a
-separate process side-steps that entirely.
+We drive the UI from inside the same Qt process (rather than via an
+accessibility API like xa11y/UIA) because Deadline Cloud Service Managed
+Fleet Windows workers run as a service in Session 0 with no interactive
+desktop — Windows UI Automation returns an empty tree there. Qt itself
+doesn't care about the desktop session, so widget access works fine.
 
 Usage (called by run_test.py):
     c4dpy.exe driver.py <output-dir>
@@ -22,12 +22,10 @@ Usage (called by run_test.py):
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
 import sys
-import threading
 import traceback
 from pathlib import Path
+from typing import Optional
 
 import c4d  # type: ignore[import-not-found]
 
@@ -76,44 +74,94 @@ def _build_scene(scene_dir: Path) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# Sidecar discovery
+# UI automation via Qt
 # --------------------------------------------------------------------------- #
-def _find_sidecar_python() -> Path:
+def _save_widget_screenshot(widget, path: Path) -> bool:
     """
-    The sidecar must run outside c4dpy. xa11y was installed via
-    install_test_deps() into Cinema 4D's bundled python interpreter
-    (``<C4D>/resource/modules/python/libs/<arch>/python.exe``), so use
-    *that* python — it sees the same site-packages where xa11y lives.
+    Snapshot a widget via Qt's QWidget.grab() — works without a desktop
+    session because Qt renders the widget itself rather than reading from
+    the Windows compositor. Returns True on success.
     """
-    c4d_location = os.environ.get("C4D_LOCATION")
-    candidates: list[Path] = []
-    if c4d_location:
-        c4d = Path(c4d_location)
-        if sys.platform == "win32":
-            candidates.append(c4d / "resource" / "modules" / "python" / "libs" / "win64" / "python.exe")
-        else:
-            candidates.append(c4d / "resource" / "modules" / "python" / "libs" / "linux64" / "python")
+    try:
+        pixmap = widget.grab()
+        ok = bool(pixmap.save(str(path), "PNG"))
+        log(f"saved screenshot ({path.stat().st_size} bytes): {path} ok={ok}")
+        return ok
+    except Exception:
+        log("widget screenshot failed")
+        traceback.print_exc()
+        return False
 
-    for p in candidates:
-        if p.is_file():
-            return p
 
-    # Last resort: rely on PATH.
-    fallback = shutil.which("python") or shutil.which("python.exe")
-    if not fallback:
-        raise RuntimeError(
-            "No usable Python interpreter found for the xa11y sidecar."
-        )
-    return Path(fallback)
+def _drive_dialog(dialog, output_dir: Path, errors: list[str]) -> None:
+    """
+    Drive the dialog to the "Export bundle" path. Runs as a QTimer
+    callback inside the dialog's own event loop.
+    """
+    try:
+        log("driving submitter: snapping screenshot before clicking Export bundle")
+        # Make sure the dialog has had a paint event before grabbing.
+        from qtpy.QtWidgets import QApplication  # type: ignore[import-not-found]
+        QApplication.processEvents()
+        _save_widget_screenshot(dialog, output_dir / "submitter-window.png")
+
+        # The export button is wired up at construction time:
+        #   self.export_bundle_button = QPushButton(tr("Export bundle"))
+        #   self.export_bundle_button.clicked.connect(self.on_export_bundle)
+        button = getattr(dialog, "export_bundle_button", None)
+        if button is None:
+            raise RuntimeError(
+                "dialog has no export_bundle_button attribute; submitter API changed?"
+            )
+        log(f"clicking export_bundle_button (text={button.text()!r})")
+        button.click()
+        log("on_export_bundle returned (will close success dialog from event loop)")
+    except Exception:
+        traceback.print_exc()
+        errors.append(traceback.format_exc())
+        try:
+            dialog.close()
+        except Exception:
+            pass
+
+
+def _install_messagebox_dismisser(errors: list[str]) -> None:
+    """
+    on_export_bundle pops a QMessageBox.information(...) on success which
+    is modal — it would block our QTimer callback chain. Replace it with
+    a no-op for the duration of the test so the dialog closes cleanly.
+
+    QMessageBox.critical is left intact so failure paths still surface.
+    """
+    try:
+        from qtpy.QtWidgets import QMessageBox  # type: ignore[import-not-found]
+        original = QMessageBox.information
+
+        def _silent_information(*args, **kwargs):  # type: ignore[no-untyped-def]
+            try:
+                # args may be (parent, title, text, ...).
+                title = args[1] if len(args) > 1 else "?"
+                text = args[2] if len(args) > 2 else "?"
+                log(f"QMessageBox.information suppressed: {title!r} / {text!r}")
+            except Exception:
+                pass
+            return QMessageBox.Ok
+
+        QMessageBox.information = staticmethod(_silent_information)  # type: ignore[assignment]
+        log("QMessageBox.information patched to no-op")
+    except Exception:
+        log("failed to patch QMessageBox.information; success popup may block")
+        traceback.print_exc()
+        errors.append(traceback.format_exc())
 
 
 # --------------------------------------------------------------------------- #
 # Submitter launch
 # --------------------------------------------------------------------------- #
-def _launch_submitter(output_dir: Path) -> tuple[Path, int]:
+def _launch_submitter(output_dir: Path) -> Path:
     """
-    Show the real submitter dialog and let the xa11y sidecar click Export
-    bundle. Returns (path-to-exported-bundle, sidecar-exit-code).
+    Show the real submitter dialog and drive Export bundle via Qt.
+    Returns the path to the exported bundle on disk.
     """
     from qtpy import QtWidgets  # type: ignore[import-not-found]
     from qtpy.QtCore import QTimer  # type: ignore[import-not-found]
@@ -141,38 +189,21 @@ def _launch_submitter(output_dir: Path) -> tuple[Path, int]:
 
     dialog = _show_submitter(str(temp_dir), None)
     dialog.setStyleSheet(C4D_STYLE)
+    log(f"dialog window title: {dialog.windowTitle()!r}")
 
-    # Spawn the xa11y sidecar.
-    sidecar = Path(__file__).resolve().parent / "automate.py"
-    if not sidecar.is_file():
-        # When invoked from inside an OpenJD session, the file is just
-        # next to driver.py (which run_test.py copied/staged).
-        sidecar = Path(__file__).parent / "automate.py"
-    py = _find_sidecar_python()
-    log(f"sidecar python: {py}")
-    log(f"sidecar script: {sidecar}")
+    errors: list[str] = []
+    _install_messagebox_dismisser(errors)
 
-    sidecar_log = output_dir / "automate.log"
-    sidecar_proc = subprocess.Popen(
-        [str(py), str(sidecar), str(os.getpid()), str(output_dir)],
-        stdout=open(sidecar_log, "w", encoding="utf-8", buffering=1),
-        stderr=subprocess.STDOUT,
-    )
-    log(f"sidecar pid: {sidecar_proc.pid} (log -> {sidecar_log})")
+    # Schedule the click+screenshot from within the dialog's own event
+    # loop so widgets are constructed and painted before we touch them.
+    drive_timer = QTimer(dialog)
+    drive_timer.setSingleShot(True)
+    drive_timer.timeout.connect(lambda: _drive_dialog(dialog, output_dir, errors))
+    drive_timer.start(2000)  # 2s lets the deadline-cloud auth probe settle
 
-    sidecar_result: dict[str, int] = {}
-
-    def _watch_sidecar():
-        sidecar_result["exit"] = sidecar_proc.wait()
-        log(f"sidecar exited with code {sidecar_result['exit']}")
-
-    watcher = threading.Thread(target=_watch_sidecar, daemon=True)
-    watcher.start()
-
-    # Failsafe: if the sidecar never makes the dialog go away (e.g. xa11y
-    # can't see the UI at all), close the dialog so exec_() returns and
-    # the worker doesn't hang forever.
-    HANG_TIMEOUT_S = 240
+    # Failsafe: if anything goes wrong and the dialog never closes, kill
+    # the modal so the worker doesn't hang.
+    HANG_TIMEOUT_S = 90
 
     def _force_close():
         log(f"force-close timer fired after {HANG_TIMEOUT_S}s — closing dialog")
@@ -180,68 +211,33 @@ def _launch_submitter(output_dir: Path) -> tuple[Path, int]:
             dialog.close()
         except Exception:
             traceback.print_exc()
-        # Kill the sidecar too in case it's still polling.
-        if sidecar_proc.poll() is None:
-            try:
-                sidecar_proc.kill()
-            except Exception:
-                pass
 
-    timer = QTimer(dialog)
-    timer.setSingleShot(True)
-    timer.timeout.connect(_force_close)
-    timer.start(HANG_TIMEOUT_S * 1000)
+    hang_timer = QTimer(dialog)
+    hang_timer.setSingleShot(True)
+    hang_timer.timeout.connect(_force_close)
+    hang_timer.start(HANG_TIMEOUT_S * 1000)
 
     log("entering dialog.exec_()")
     dialog.exec_()
     log("dialog.exec_() returned")
-    timer.stop()
+    drive_timer.stop()
+    hang_timer.stop()
 
-    # Give the sidecar a moment to finish writing artifacts.
-    if sidecar_proc.poll() is None:
-        try:
-            sidecar_proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            log("sidecar still running after dialog closed; killing")
-            sidecar_proc.kill()
-            sidecar_proc.wait(timeout=5)
-    watcher.join(timeout=5)
-    exit_code = sidecar_result.get("exit", -1)
-
-    # Tee the sidecar log to our own stdout so it lands in CloudWatch and
-    # we don't have to wait for job-output upload to triage failures.
-    if sidecar_log.is_file():
-        log(f"--- begin {sidecar_log.name} ---")
-        try:
-            for line in sidecar_log.read_text(encoding="utf-8", errors="replace").splitlines():
-                print(line, flush=True)
-        except Exception:
-            traceback.print_exc()
-        log(f"--- end {sidecar_log.name} ---")
-    tree = output_dir / "submitter-tree.txt"
-    if tree.is_file():
-        log(f"--- begin {tree.name} ({tree.stat().st_size} bytes) ---")
-        try:
-            text = tree.read_text(encoding="utf-8", errors="replace")
-            # Cap at 30 KB so we don't blow out CloudWatch on huge dumps.
-            if len(text) > 30_000:
-                text = text[:30_000] + f"\n... [truncated, full file is {tree.stat().st_size} bytes]"
-            for line in text.splitlines():
-                print(line, flush=True)
-        except Exception:
-            traceback.print_exc()
-        log(f"--- end {tree.name} ---")
+    if errors:
+        raise RuntimeError(
+            "UI driver reported errors:\n" + "\n---\n".join(errors)
+        )
 
     # Find the exported bundle dir under job_history_dir/<YYYY-mm>/.
     bundles = sorted(p for p in job_history_dir.glob("*/*") if p.is_dir())
     if not bundles:
         raise RuntimeError(
             f"No exported bundle found under {job_history_dir}. "
-            f"Sidecar exit={exit_code}; check automate.log and submitter-tree.txt."
+            "Did Export bundle actually run?"
         )
     bundle_path = bundles[-1]
     log(f"exported bundle at: {bundle_path}")
-    return bundle_path, exit_code
+    return bundle_path
 
 
 # --------------------------------------------------------------------------- #
@@ -259,7 +255,7 @@ def main() -> int:
     log(f"sys.executable:  {sys.executable}")
     log(f"output dir:      {out_dir}")
     log(f"sys.path[:6]:    {sys.path[:6]}")
-    for mod in ("PySide6", "PySide6.QtWidgets", "shiboken6", "qtpy", "xa11y"):
+    for mod in ("PySide6", "PySide6.QtWidgets", "shiboken6", "qtpy"):
         try:
             m = __import__(mod, fromlist=[""])
             log(f"import {mod}: OK ({getattr(m, '__file__', '?')})")
@@ -277,14 +273,9 @@ def main() -> int:
     scene_path = _build_scene(scene_dir)
     log(f"saved scene: {scene_path}")
 
-    bundle_path, sidecar_exit = _launch_submitter(out_dir)
-
-    # Surface the bundle path for run_test.py via a sidecar file. Keeps
-    # the contract trivial — no parsing of stdout.
+    bundle_path = _launch_submitter(out_dir)
     (out_dir / "bundle-path.txt").write_text(str(bundle_path), encoding="utf-8")
-    (out_dir / "automate-exit.txt").write_text(str(sidecar_exit), encoding="utf-8")
     log(f"wrote bundle-path.txt -> {bundle_path}")
-    log(f"automate sidecar exit code: {sidecar_exit}")
     return 0
 
 

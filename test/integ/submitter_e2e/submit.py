@@ -35,7 +35,6 @@ HERE = Path(__file__).resolve().parent
 BUNDLE_DIR = HERE / "job"
 RUN_TEST = HERE / "run_test.py"
 DRIVER = HERE / "driver.py"
-AUTOMATE = HERE / "automate.py"
 
 
 def _embed(template_text: str, name: str, source: Path) -> str:
@@ -75,7 +74,6 @@ def main() -> int:
     template = (BUNDLE_DIR / "template.yaml").read_text(encoding="utf-8")
     template = _embed(template, "RunTest", RUN_TEST)
     template = _embed(template, "Driver", DRIVER)
-    template = _embed(template, "Automate", AUTOMATE)
 
     staged = Path(tempfile.mkdtemp(prefix="c4d-e2e-"))
     try:
