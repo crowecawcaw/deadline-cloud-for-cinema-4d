@@ -92,7 +92,7 @@ def build_installer(
     else:
         raise ValueError(f"Unknown platform '{installer_platform}'")
 
-    build_deps_bundle()
+    build_deps_bundle(target_platform=installer_platform)
 
     install_builder_cli = install_builder_location / "bin" / "builder"
     out_dir = workdir / "out"

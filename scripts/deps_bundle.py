@@ -230,16 +230,48 @@ def _copy_zip_to_destination(zip_path: Path) -> Path:
     return zip_destination
 
 
-def _install_pyside6(install_path: Path) -> None:
-    """Install PySide6 and shiboken6, then strip to only the files in PYSIDE6_ALLOWLIST."""
+def _install_pyside6(install_path: Path, target_platform: str | None = None) -> None:
+    """Install PySide6 and shiboken6, then strip to only the files in PYSIDE6_ALLOWLIST.
+
+    When ``target_platform`` is set (e.g. "Windows" while building on macOS),
+    pip is told to fetch the wheel for that platform/abi rather than the host's.
+    Without this, a Windows installer built on macOS would carry macOS .dylibs
+    that don't load on the worker.
+
+    The base_env may already contain a host-platform PySide6/shiboken6 from
+    the earlier dependency-resolution step. Wipe those first so the new
+    install isn't a no-op (pip silently keeps existing files in --target dirs).
+    """
+    for prefix in ("PySide6", "shiboken6"):
+        for path in install_path.glob(prefix):
+            shutil.rmtree(path, ignore_errors=True)
+        for path in install_path.glob(f"{prefix}-*.dist-info"):
+            shutil.rmtree(path, ignore_errors=True)
+        for path in install_path.glob(f"{prefix}_*.dist-info"):
+            shutil.rmtree(path, ignore_errors=True)
+
     pip_args = [
         "pip",
         "install",
         "--target",
         str(install_path),
         "--only-binary=:all:",
-        *PYSIDE6_PACKAGES,
     ]
+    if target_platform == "Windows":
+        pip_args += [
+            "--platform", "win_amd64",
+            "--implementation", "cp",
+            "--abi", "abi3",
+            "--python-version", "3.11",
+        ]
+    elif target_platform == "Linux":
+        pip_args += [
+            "--platform", "manylinux2014_x86_64",
+            "--implementation", "cp",
+            "--abi", "abi3",
+            "--python-version", "3.11",
+        ]
+    pip_args += list(PYSIDE6_PACKAGES)
     subprocess.run(pip_args, check=True)
     _strip_pyside6(install_path)
 
@@ -267,7 +299,14 @@ def _strip_pyside6(install_path: Path) -> None:
                     dirpath.rmdir()
 
 
-def build_deps_bundle() -> None:
+def build_deps_bundle(target_platform: str | None = None) -> None:
+    """Build the dependency bundle.
+
+    ``target_platform`` is an optional Python ``platform.system()``-style
+    string ("Windows", "Linux", "Darwin"). When set, the PySide6 install
+    is cross-fetched for that platform so a host on a different OS can
+    still produce a working installer.
+    """
     with TemporaryDirectory() as working_directory:
         working_directory = Path(working_directory)
         project_dict = get_project_dict()
@@ -278,7 +317,7 @@ def build_deps_bundle() -> None:
         base_env = _build_base_environment(working_directory, deps_noopenjd)
         native_dependency_paths = _download_native_dependencies(working_directory, base_env)
         _copy_native_to_base_env(base_env, native_dependency_paths)
-        _install_pyside6(base_env)
+        _install_pyside6(base_env, target_platform=target_platform)
         zip_path = _get_zip_path(working_directory, project_dict)
         _zip_bundle(base_env, zip_path)
         print(list(working_directory.glob("*")))

@@ -58,6 +58,13 @@ def main() -> int:
     print(f"[driver] C4D version:     {c4d.GetC4DVersion()}")
     print(f"[driver] sys.executable:  {sys.executable}")
     print(f"[driver] output bundle:   {out_dir}")
+    print(f"[driver] sys.path[:6]:    {sys.path[:6]}")
+    for mod in ("PySide6", "PySide6.QtWidgets", "shiboken6", "qtpy"):
+        try:
+            m = __import__(mod, fromlist=[""])
+            print(f"[driver] import {mod}: OK ({getattr(m, '__file__', '?')})")
+        except Exception as e:
+            print(f"[driver] import {mod}: FAILED ({type(e).__name__}: {e})")
 
     try:
         import deadline.cinema4d_submitter as cs  # type: ignore[import-not-found]

@@ -254,12 +254,14 @@ def run_driver(c4dpy: Path, driver: Path, submitter_install: Path, bundle_dir: P
     # and pass the basename.
     env = {
         **os.environ,
-        # Prepend the install dir so the submitter is importable inside c4dpy
-        # for the GitHub mode. For installer mode, the installer already wrote
-        # this env var system-wide, but setting it here keeps the behavior
-        # symmetric and tests the same import path.
+        # Prepend the install dir so the submitter is importable inside c4dpy.
+        # C4DPYTHONPATH311 is C4D's plugin search path; PYTHONPATH covers
+        # ordinary import resolution inside c4dpy too.
         "C4DPYTHONPATH311": (
             str(submitter_install) + os.pathsep + os.environ.get("C4DPYTHONPATH311", "")
+        ),
+        "PYTHONPATH": (
+            str(submitter_install) + os.pathsep + os.environ.get("PYTHONPATH", "")
         ),
     }
 
