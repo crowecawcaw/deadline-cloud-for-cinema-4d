@@ -1,0 +1,20 @@
+parameterValues:
+# These point at the orchestrator + c4dpy driver in this repo. The deadline
+# CLI uploads them as job attachments; the worker resolves the values to
+# the local copies under the session working dir.
+- name: RunTest
+  value: ../run_test.py
+- name: Driver
+  value: ../driver.py
+- name: SourceMode
+  value: github
+- name: GitRepo
+  value: https://github.com/crowecawcaw/deadline-cloud-for-cinema-4d.git
+- name: GitRef
+  value: add-submitter-e2e
+# Queue-env parameter overrides: install the cinema4d package from the
+# deadline-cloud channel before our step runs.
+- name: CondaPackages
+  value: cinema4d=2026.*
+- name: CondaChannels
+  value: deadline-cloud

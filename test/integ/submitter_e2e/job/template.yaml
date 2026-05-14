@@ -1,0 +1,98 @@
+specificationVersion: 'jobtemplate-2023-09'
+name: c4d-submitter-e2e
+description: >
+  End-to-end test for the Cinema 4D Deadline Cloud submitter. Two source
+  modes are supported via the SourceMode parameter:
+    * github   — install the submitter from a Git ref (dev workflow).
+    * installer — run the InstallBuilder-produced .exe attached as the
+      Installer parameter (full integration test).
+  All test logic lives in run_test.py / driver.py (also attached as job
+  inputs); this template only sets up the env and hands off.
+parameterDefinitions:
+- name: RunTest
+  type: PATH
+  objectType: FILE
+  dataFlow: IN
+  description: Path to run_test.py (the orchestrator).
+- name: Driver
+  type: PATH
+  objectType: FILE
+  dataFlow: IN
+  description: Path to driver.py (the c4dpy-side script).
+- name: SourceMode
+  type: STRING
+  default: github
+  allowedValues: [github, installer]
+  description: Where to get the submitter from.
+- name: GitRepo
+  type: STRING
+  default: https://github.com/aws-deadline/deadline-cloud-for-cinema-4d.git
+  description: Git URL of the submitter repo (mode=github).
+- name: GitRef
+  type: STRING
+  default: mainline
+  description: Branch, tag, or commit to install (mode=github).
+- name: Installer
+  type: PATH
+  objectType: FILE
+  dataFlow: IN
+  default: ''
+  description: >
+    Path to an InstallBuilder-produced submitter installer .exe attached
+    as a job input (mode=installer). Ignored for mode=github.
+
+steps:
+- name: SubmitterE2E
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [windows]
+  script:
+    actions:
+      onRun:
+        command: powershell
+        args: ['-ExecutionPolicy', 'Bypass', '-File', '{{Task.File.RunPS}}']
+        timeout: 1800
+    embeddedFiles:
+    - name: RunPS
+      type: TEXT
+      filename: run.ps1
+      data: |
+        # Thin shim: just hands off to run_test.py with the right args.
+        # All test logic lives in the Python orchestrator.
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference    = 'SilentlyContinue'
+
+        if (-not $env:C4D_LOCATION) {
+          throw "C4D_LOCATION is not set; the cinema4d conda package was not activated."
+        }
+
+        $c4dPython = Join-Path $env:C4D_LOCATION 'resource\modules\python\libs\win64\python.exe'
+        if (-not (Test-Path $c4dPython)) {
+          throw "Cinema 4D bundled python not found at $c4dPython"
+        }
+
+        $work = Join-Path $env:OPENJD_SESSION_WORKING_DIR 'submitter-e2e'
+        New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+        # run_test.py imports driver.py from the same directory, so make sure
+        # they end up co-located in $work.
+        Copy-Item -Force '{{Param.Driver}}'  (Join-Path $work 'driver.py')
+
+        $args = @(
+          '{{Param.RunTest}}',
+          '--mode', '{{Param.SourceMode}}',
+          '--work-dir', $work
+        )
+        if ('{{Param.SourceMode}}' -eq 'github') {
+          $args += @('--git-repo', '{{Param.GitRepo}}', '--git-ref', '{{Param.GitRef}}')
+        } elseif ('{{Param.SourceMode}}' -eq 'installer') {
+          if (-not '{{Param.Installer}}') {
+            throw "SourceMode=installer requires the Installer parameter (a PATH input)."
+          }
+          $args += @('--installer-path', '{{Param.Installer}}')
+        }
+
+        Write-Host "Handing off to: $c4dPython $args"
+        & $c4dPython @args
+        if ($LASTEXITCODE -ne 0) { throw "run_test.py failed (exit $LASTEXITCODE)" }
